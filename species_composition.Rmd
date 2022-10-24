@@ -1,0 +1,125 @@
+---
+title: "DFO species to Atlantis groups"
+author: "Alberto Rovellini"
+date: "5/18/2021"
+output: html_document
+---
+
+Visualise how the DFO species are mapped to the Atlantis groups. Attribution of DFO species to Atlantis groups was based on the mapping already done for the RACE data, so: (1) it is only as accurate as the RACE mapping; (2) some species may fit in different Atlantis groups in GOA and BC, but that is not accounted for here. Keep an eye out for oddities.
+
+```{r}
+library(tidyverse)
+library(kableExtra)
+library(data.table)
+```
+
+```{r}
+select <- dplyr::select
+```
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Read in the DFO species list with the corresponding Atlantis group code. Read in the Atlantis groups for longer names.
+```{r}
+dfo_species <- read.csv("data/dfo_species_atlantis.csv")
+atlantis_groups <- read.csv("data/GOA_Groups.csv", fileEncoding = "UTF-8-BOM")
+```
+
+```{r}
+atlantis_groups <- atlantis_groups %>% select(Code,Name,LongName)
+```
+
+Join.
+```{r}
+dfo_species <- dfo_species %>% left_join(atlantis_groups, by = c("Atlantis.group"="Code"))
+```
+
+Find what species are undecided and remove them from the DFO data for now.
+```{r}
+paste(dfo_species %>% filter(Atlantis.group == "?") %>% select(English.common.name) %>% pull(), sep = ", ", collapse = ", ")
+
+dfo_species <- dfo_species %>% filter(Atlantis.group != "?")
+```
+Many of these are generic records that could belong to multiple Atlantis groups. Some are groups that I have not yet mnade decisions about, such as hake, lingcod, and saury.
+
+Write it all up in a table.
+```{r}
+species_table <- dfo_species %>% group_by(Atlantis.group) %>%
+  mutate(Scientific = paste0(Scientific.name, collapse = ", "),
+         Common = paste0(English.common.name, collapse = ", ")) %>%
+  select(Atlantis.group, LongName:Common) %>%
+  distinct()
+
+kbl(species_table, col.names = c("Atlantis group code", "Atlantis group name", "DFO scientific name", "DFO common name")) %>%
+  kable_paper(full_width = F) %>%
+  column_spec(1, width = "5em") %>%
+  column_spec(2, width = "5em") %>%
+  column_spec(3, width = "40em") %>%
+  column_spec(4, width = "30em")
+```
+
+# Read in data
+
+Read in catch from bottom trawl surveys. Remember that we are dropping WCHG from here (and I am not too convinced yet that this is a good idea).
+```{r}
+path_to_surveys <- "C:/Users/Alberto Rovellini/Documents/GOA/SDM/Canada_stages/catch_to_CPUE_DFO/surveys"
+all_surveys <- dir(path_to_surveys)
+
+# drop WCHG
+all_surveys <- setdiff(all_surveys, "WCHG")
+
+get_catch <- function(survey_area){
+  sa <- survey_area
+  sa_path <- paste(path_to_surveys,sa,sep="/")
+  catch <- read.csv(paste(sa_path,paste(sa,"catch.csv",sep="_"),sep="/"))
+  catch$Survey.area <- sa
+  return(catch)
+}
+catch_all <- rbindlist(lapply(all_surveys,FUN = get_catch))
+
+catch_all <- catch_all %>% mutate(Haul.Join.ID = paste(Trip.identifier,Set.number,sep = '_'))
+
+# it seems quite common that this data includes NA catches. Sometimes the catch in weight is NA and there are counts, sometimes both empty (is that presence/absence?). Drop all empty catches in weight
+catch_all <- catch_all %>% filter(!is.na(Catch.weight..kg.))
+```
+
+Add Atlantis group, subset to RFS, see the catch comp of all species for that group.
+```{r}
+comp <- catch_all %>% 
+  left_join((dfo_species %>% select(Scientific.name,Name)), by = 'Scientific.name') %>%
+  group_by(Survey.Year,Name,Scientific.name) %>%
+  summarize(Catch = sum(Catch.weight..kg., na.rm=T)) %>%
+  group_by(Survey.Year,Name) %>%
+  mutate(Catch.AG=sum(Catch),
+         Prop = Catch/Catch.AG) %>%
+  ungroup() %>%
+  filter(Name=='Rockfish_slope') %>%
+  arrange(Survey.Year,desc(Prop))
+
+comp %>% ggplot()+
+  geom_bar(aes(x = Survey.Year, y = Prop, fill = Scientific.name), stat = "identity", position = "stack")+
+  theme_minimal()
+```
+
+For all times.
+Add Atlantis group, subset to RFS, see the catch comp of all species for that group.
+```{r}
+catch_all %>% 
+  left_join((dfo_species %>% select(Scientific.name,Name)), by = 'Scientific.name') %>%
+  group_by(Name,Scientific.name) %>%
+  summarize(Catch = sum(Catch.weight..kg., na.rm=T)) %>%
+  group_by(Name) %>%
+  mutate(Catch.AG=sum(Catch),
+         Prop = Catch/Catch.AG) %>%
+  ungroup() %>%
+  filter(Name=='Rockfish_slope') %>%
+  arrange(desc(Prop))
+
+comp %>% ggplot()+
+  geom_bar(aes(x = Name, y = Prop, fill = Scientific.name), stat = "identity", position = "stack")+
+  theme_minimal()
+```
+

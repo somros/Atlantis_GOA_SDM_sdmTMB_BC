@@ -1,0 +1,366 @@
+---
+title: "Atlantis biomass distributions with sdmTMB - lat, lon, depth. Canada model domain"
+author: "Alberto Rovellini"
+date: "5/17/2021"
+output:
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_float: true
+---
+
+__This document is based on Gemma's code.__
+
+This is a template for fitting sdmTMB to GOA bottom trawl data. For each species, it fits sdmTMB to life stages (juveniles or adults - all lumped for now in the DFO data) to predict CPUE in number of individuals per km$^{2}$. This predicted CPUE is then scaled up to box area in Atlantis, to get numbers of individuals per box and proportion of the total, which is what we need to initialise Atlantis. This only includes British Columbia. 
+
+This workflow is based on the following assumptions:
+
+1. We use lat, lon and depth as predictors. We do not use environmental covariates as predictors because we are not attempting to explain why fish species are distributed the way they are, but rather we are trying to have sensible generic distributions over the model domain throughout the study period.
+2. We predict over a regular grid. The size of this grid is 10 km at the moment for computational efficiency, but this is arbitrary and we may need to test different grid sizes and see how the results change. This is the grid size we are using for the GOA, but here we are using the same SPDE mesh for a much smaller area, and therefore we might need to adjust the prediction grid accordingly.
+3. We are not so interested in accurate predictions for any one year, but rather in representative means of where the fish has been over the last few decades. Here, we run the model without a temporal component. This is different from the RACE-GAP workflow, where we use year as model predictor, make predictions by year, and then take averages. See notes below.
+
+Notes specific to DFO:
+
+1. There are not as many data points for the DFO data, also because different areas (Queen Charlotte Sound, Hecate Strait, and Haida Gwaii) are surveyed in different years. Here we aggregate all data and run a model without temporal definition, rather than making predictions year-by-year where some areas are not sampled at all in one year. This was not the case for the RACE data, because although the stations vary in each year, they span most of the GOA in most years (with a couple of exceptions). 
+2. Number of individuals is the "Estimated number of pieces in the catch", expressed as Catch Count (pieces). A lot of sets (the DFO equivalent of tows) have NA for that. So it seems like CPUE in weight is more reliable than CPUE in individuals. This is a mismatch with the GOA RACE data, where we decided to do by numbers (because that is what Atlantis needs). Not sure yet how to bring things together.
+3. This data extends deeper than 1000 m. We may decide to discard the data points deeper than 1000 m for consistency with the RACE-GAP data, or we may just keep them all for the sake of sample size. Sets deeper than 1000 m are <1% of the sets, so probably hardly any difference either way.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Read data
+```{r}
+dfo_data <- species_all_hauls
+```
+
+This is DFO data from [here](https://open.canada.ca/data/en/dataset/a278d1af-d567-4964-a109-ae1e84cbd24a). Note: for lat and lon, for now I am using the start values for each tow, but it would be easy to get the coordinates for the midpoint of the tow.
+
+Take a quick look at the data spatially.
+```{r, fig.width = 12, fig.height = 16}
+# coast mask
+coast <- map("worldHires", regions = c("Canada", "USA"), plot = FALSE, fill = TRUE)
+coast <- coast %>% st_as_sf() #%>% st_transform(crs = atlantis_bgm$extra$projection)
+
+ggplot()+
+  geom_point(data = dfo_data, aes(lon, lat, colour = log1p(biom_kgkm2)), size = 1.5)+
+  scale_colour_viridis_c()+
+  geom_sf(data = coast)+
+  coord_sf(xlim = c(min(dfo_data$lon),max(dfo_data$lon)), ylim=c(min(dfo_data$lat),max(dfo_data$lat)))+
+  theme_minimal()+
+  facet_wrap(~year, ncol = 3)+
+  labs(title = paste(dfo_data$name,"CPUE from DFO bottom trawl survey"))#, race_data$stage, sep = " "))
+```
+
+Take a quick look at time series of total numbers CPUE from raw data. This makes little sense for the DFO data because the areas have different size, and different areas are surveyed in different years (e.g., see low in 2014).
+```{r, fig.width = 6, fig.height = 4}
+biom_year <- dfo_data %>% group_by(year) %>% summarise(biom = sum(log1p(biom_kgkm2)))
+
+ggplot(biom_year, aes(year, log(biom)))+
+  geom_point()+
+  geom_path()+
+  theme_minimal()+
+  labs(title = paste(dfo_data$name,"total GOA CPUE from bottom \n trawl"))
+```
+
+The sampling design for DFO bottom trawl data is to survey different areas in different years. For species with low catchability in particular, this means that running a model with year as a predictor can present convergence issues. In addition, predicting back over the entire area even in years where only West Coast Haida Gwaii was surveyed is problematic. Run models without year factor here. This is conceptually different from the RACE-GAP analysis for the rest of the GOA.
+
+# sdmTMB
+
+## Create spatial mesh
+
+This is the mesh that the sdmTMB algorithm uses to estimate spatial autocorrelation. The speed of model running is highly dependent on number of knots. 100 is quite low, you'd want to make sure it was robust by checking multiple resolutions when you have a model you want to actually use (people use like 350-450 or something).
+
+**Note:** SPDE = Stochastic Partial Differential Equations approach. Some material can be found [here](https://becarioprecario.bitbucket.io/spde-gitbook/ch-intro.html#sec:spde), but basically it is a way of calculating the position of the mesh knots. 
+```{r}
+dfo_spde <- make_mesh(dfo_data, c("lon", "lat"), n_knots = knots) # usually 450
+plot(dfo_spde)
+```
+
+Check out the distribution of the biomass density response variable.
+```{r, fig.width = 6, fig.height = 4}
+hist(dfo_data$biom_kgkm2, breaks = 30)
+```
+
+```{r, fig.width = 6, fig.height = 4}
+hist(log1p(dfo_data$biom_kgkm2), breaks = 30)
+```
+
+Proportion of zeroes in percentage.
+```{r}
+length(which(dfo_data$biom_kgkm2 == 0))/nrow(dfo_data)*100
+```
+
+## Space, time, and depth model.
+
+Model type: the distribution of the response variable plotted above should give a sense of what model is most appropriate. CPUE data for many of these species resemble a Tweedie distribution when log-transformed, so we use a Tweedie model with a log link. Some groups may warrant a different model, and this will be evaluated case-by-case depending on convergence issues, distribution of model residuals, and model skill metrics (see below).
+
+We run the model without year factor here.
+```{r, include = FALSE}
+start.time <- Sys.time()
+m_depth <- sdmTMB(
+  data = dfo_data, 
+  formula = biom_kgkm2 ~ 0 + s(depth, k = 5), # predicting numbers - we will need numbers for Atlantis
+  time = NULL, 
+  spde = dfo_spde, 
+  reml = TRUE,
+  anisotropy = FALSE,
+  spatial_trend = FALSE, 
+  spatial_only = TRUE,
+  silent = FALSE,
+  control = sdmTMBcontrol(),
+  nlminb_loops = 3,
+  newton_steps = 10,
+  family = tweedie(link = "log"))
+end.time <- Sys.time()
+time.taken_m_depth <- end.time - start.time
+time.taken_m_depth
+```
+
+Check information on model convergence. From the nlminb help page we know that an integer 0 indicates succesful convergence. Additional information on convergence can be checked with m_depth$model$message. According to the original PORT optimization documentation, “Desirable return codes are 3, 4, 5, and sometimes 6”.
+```{r}
+if(m_depth$model$convergence == 0){print("The model converged.")} else {print("Check convergence issue.")}
+m_depth$model$message
+```
+
+Check out model residuals.
+```{r, fig.width = 6, fig.height = 4}
+dfo_data$resids <- residuals(m_depth) # randomized quantile residuals
+hist(dfo_data$resids)
+```
+
+And QQ plot.
+```{r}
+qqnorm(dfo_data$resids)
+abline(a = 0, b = 1)
+```
+
+Plot the response curve from the depth smooth term.
+```{r, fig.width = 6, fig.height = 4}
+plot(m_depth$mgcv_mod, rug = TRUE)
+```
+
+Finally, plot the residuals in space. If residuals are constantly larger/smaller in some of the areas, it may be sign that the model is biased and it over/underpredicts consistently for some areas. Residuals should be randomly distributed in space. We need to read in the Atlantis BGM file to do that, as we need the right projection.
+
+Read in BGM for correcto projection.
+```{r}
+atlantis_bgm <- read_bgm("data/GOA_WGS84_V4_final.bgm")
+```
+
+```{r, fig.width = 12, fig.height=6}
+dfo_sf <- dfo_data %>% st_as_sf(coords = c(x = "lon", y = "lat"), crs = 4326) %>% st_transform(crs = atlantis_bgm$extra$projection) # turn to spatial object
+
+coast <- coast %>% st_as_sf() %>% st_transform(crs = atlantis_bgm$extra$projection)
+
+#define coordinate limits for BGM projection
+coord_lims <- dfo_sf %>% st_coordinates() %>% data.frame() %>% set_names(c("x","y")) %>% summarise(xmin=min(x),xmax=max(x),ymin=min(y),ymax=max(y))
+
+ggplot()+
+  geom_sf(data = dfo_sf, aes(color = resids, alpha = .8))+
+  scale_color_viridis()+
+  geom_sf(data = coast)+
+  coord_sf(xlim = c(coord_lims$xmin,coord_lims$xmax), ylim=c(coord_lims$ymin,coord_lims$ymax))+
+  theme_minimal()+
+  labs(title = paste(dfo_data$name,"model residuals in space"))#, race_data$stage, sep = " "))+
+  #facet_wrap(~year, ncol = 3)
+```
+
+# Predictions from SDM
+
+Take a grid (which must contain information on the predictors we used to build the model) and predict the biomass index over such grid based on the predictors. The grid is currently a regular grid with 10-km cell size, but 10 km might not be enough to get prediction points in all boxes - especially for a couple very small and narrow boxes at the western end of the model domain. Revisit this if necessary, but a finer mesh could be difficult to justify compared to the density of the survey data. The grid covers the entire Atlantis model domain, including the non-dynamic boundary boxes (deeper than 1000 m).
+
+Read in the Atlantis prediction grid (10 km) modified in Atlantis_grid_covars.R (code not included here).
+
+**For DFO:** Because of the different spatial scale (smaller region, and some comparatively small boxes), the 10 km grid may be too coarse. However, I think the grid needs to be the same for GOA and BC - as we have small boxes in GOA too. So either downsize both to <10 km, or keep it this way.
+```{r}
+atlantis_boxes <- atlantis_bgm %>% box_sf()
+```
+
+**Important:** depth in the DFO data is a positive number. When we use depth as predictor for in our regular grid, make sure depth is a positive number for consistency with the model variable, or else everything will be upside-down.
+```{r}
+load("data/atlantis_grid_depth.Rdata")
+
+# add coordinate columns
+atlantis_coords <- atlantis_grid_depth %>% st_as_sf(coords = c("x", "y"), crs = atlantis_bgm$extra$projection) %>%
+  st_transform(crs = "+proj=longlat +datum=WGS84") %>% dplyr::select(geometry)
+
+atlantis_grid <- cbind(atlantis_grid_depth, do.call(rbind, st_geometry(atlantis_coords)) %>%
+    as_tibble() %>% setNames(c("lon","lat")))
+
+paste("Positive depths are:", length(which(atlantis_grid$depth>0)), "out of:", nrow(atlantis_grid_depth), sep = " ") # Write out a check that depths are positive (few negatives are OK - they are on land - I'll fix it but it should not matter as island boxes will be boundary boxes in Atlantis)
+
+# add year column: not necessary as of June 1 2021 because we removed the year factor
+# all_years <- levels(factor(dfo_data$year))
+# 
+# atlantis_grid <- atlantis_grid[rep(1:nrow(atlantis_grid), length(all_years)),]
+# atlantis_grid$year <- as.integer(rep(all_years, each = nrow(atlantis_grid_depth)))
+```
+
+Make SDM predictions onto new data from depth model. **Back-transforming here, is this sensible?**
+```{r}
+predictions_dfo <- predict(m_depth, newdata = atlantis_grid, return_tmb_object = TRUE)
+atlantis_grid$estimates <- exp(predictions_dfo$data$est) #Back-transforming here, is this sensible?
+
+atlantis_grid_sf <- atlantis_grid %>% st_as_sf(coords = c("x", "y"), crs = atlantis_bgm$extra$projection) # better for plots
+```
+
+Not plotting the US (but look at it to see how it compares with RACE predictions for the GOA).
+```{r, fig.width = 12, fig.height = 6}
+#atlantis_extent<- st_bbox(atlantis_boxes) # for visualisation of the whole GOA and visual comparison with RACE predictions, to crop the coast to Canada and AK only
+
+ggplot()+
+  #geom_sf(data = atlantis_boxes, aes(fill = NULL))+
+  geom_sf(data = atlantis_grid_sf, aes(color=log1p(estimates)), size = 2)+ # taking the log for visualisation
+  geom_sf(data = coast)+
+  #coord_sf(xlim = c(atlantis_extent$xmin,atlantis_extent$xmax), ylim=c(atlantis_extent$ymin,atlantis_extent$ymax))+
+  coord_sf(xlim = c(coord_lims$xmin,coord_lims$xmax), ylim=c(coord_lims$ymin,coord_lims$ymax))+
+  scale_color_viridis(name = expression(paste("Log(CPUE) kg ", km^-2)))+
+  theme_minimal()+
+  labs(title = paste(dfo_data$name,"predicted CPUE"))#, race_data$stage, sep = " "))+
+  #facet_wrap(~year, ncol = 3)
+```
+
+Attribute the predictions to their respective Atlantis box, so that we can take box averages.
+```{r}
+atlantis_grid_means <- atlantis_grid %>% group_by(box_id) %>% #group_by(year, box_id) %>%
+  summarise(mean_estimates = mean(estimates, na.rm = TRUE)) %>% ungroup() 
+
+# join this with the box_sf file
+
+predictions_by_box <- atlantis_boxes %>% inner_join(atlantis_grid_means, by = "box_id")
+```
+
+See estimates per box for all years combined. Silence boundary boxes as they throw the scale out of whack (and they do not need predictions). Plot BC part of the model domain only.
+```{r, fig.width = 12, fig.height = 6}
+predictions_by_box <- predictions_by_box %>% rowwise() %>% mutate(mean_estimates = ifelse(isTRUE(boundary), NA, mean_estimates))
+
+ggplot()+
+  geom_sf(data = predictions_by_box[predictions_by_box$box_id>=92,], aes(fill = log1p(mean_estimates)))+ # taking the log for visualisation
+  scale_fill_viridis(name = expression(paste("Log(CPUE) kg ", km^-2)))+
+  theme_minimal()+
+  geom_sf(data = coast)+
+  #coord_sf(xlim = c(atlantis_extent$xmin,atlantis_extent$xmax), ylim=c(atlantis_extent$ymin,atlantis_extent$ymax))+
+  coord_sf(xlim = c(coord_lims$xmin,coord_lims$xmax), ylim=c(coord_lims$ymin,coord_lims$ymax))+  
+  #facet_wrap(~year, ncol = 3)+
+  labs(title = paste(dfo_data$name, "mean predicted CPUE by Atlantis box"))#, race_data$stage, sep = " "))
+```
+
+Plot the raw data again for comparison.
+```{r, fig.width = 12, fig.height = 6}
+dfo_sf <- dfo_data %>% st_as_sf(coords = c("lon","lat"), crs=4326) %>% st_transform(crs = atlantis_bgm$extra$projection)
+
+ggplot()+
+  geom_sf(data = dfo_sf, aes(colour = log1p(biom_kgkm2)), size = 2)+ # taking the log for visualisation
+  scale_colour_viridis_c(name = expression(paste("Log(CPUE) kg ", km^-2)))+
+  geom_sf(data = coast)+
+  coord_sf(xlim = c(coord_lims$xmin,coord_lims$xmax), ylim=c(coord_lims$ymin,coord_lims$ymax))+
+  theme_minimal()+
+  #facet_wrap(~year, ncol = 3)+
+  labs(title = paste(dfo_data$name,"CPUE from DFO bottom trawl survey"))#, race_data$stage, sep = " "))
+```
+
+Have a look at CPUE by depth. This is rough and quick, keep in mind that most tows happen below 300 m, so the sample is not equal between depths.
+```{r, fig.width = 6, fig.height = 4}
+ggplot(data = dfo_data, aes(x = depth, y = log1p(biom_kgkm2), color = log1p(num_km2)))+
+  scale_color_viridis()+
+  geom_point()+
+  theme_minimal()+
+  labs(title = "CPUE by depth")
+```
+Abundance information is available for only some of the tows in the data I was able to get access to.
+
+Plot data and predictions distributions.
+```{r, fig.width = 6, fig.height = 4}
+ggplot(data = dfo_data, aes(log1p(biom_kgkm2)))+
+  geom_histogram(colour = "black", fill = 'grey80')+
+  theme_minimal()
+```
+
+```{r, fig.width = 6, fig.height = 4}
+ggplot(data = atlantis_grid, aes(log1p(estimates)))+
+  geom_histogram(colour = "black", fill = 'grey80')+
+  theme_minimal()
+```
+
+# Mean predictions for the study period
+
+```{r, fig.width = 10, fig.height = 5}
+means_all_years <- predictions_by_box
+```
+
+# Model skill
+
+Trying to evaluate model skill by having a look at how well model predictions align with observations.
+
+Since this is a spatially-explicit approach, we need observations and predictions at the same location. One approach would be to look at things box-wise by looking at relationships between average CPUE from data per box and average predicted CPUE per box. While this makes sense (boxes are our unit of space in Atlantis after all), I did some testing and it does not come without issues. For example, some boxes have no data points in certain years, but have a constant number of predicted points from the regular grid every year. So, my approach at the moment is to use the locations of all RACE hauls as a prediction grid. Is this circular?  
+```{r}
+#make a prediction grid from the dfo data itself
+dfo_grid <- dfo_data %>% dplyr::select(lon, lat, depth)
+
+# add year
+# dfo_grid <- dfo_grid_tmp[rep(1:nrow(dfo_grid_tmp), length(all_years)),]
+# dfo_grid$year <- as.integer(rep(all_years, each = nrow(dfo_grid_tmp)))
+
+# predict on this grid
+predictions_at_locations <- predict(m_depth, newdata = dfo_grid, return_tmb_object = TRUE)
+dfo_grid$predictions <- exp(predictions_at_locations$data$est) # back-transforming here
+```
+
+Now join by year and coordinates to have predictions at the sampling points.
+```{r, fig.width = 12, fig.height = 6}
+dfo_corr <- dfo_data %>% left_join(dfo_grid, by = c("lat", "lon"))
+```
+
+## Observed versus predicted
+
+```{r}
+paste0("Pearson's coef observations vs predictions: ", cor(dfo_corr$biom_kgkm2, dfo_corr$predictions, use = "everything", method = "pearson"))
+```
+What is a good value here?
+
+Plot.
+```{r, fig.width = 6, fig.height = 6}
+ggplot(dfo_corr, aes(x = log1p(predictions), y = log1p(biom_kgkm2)))+ # log for visualisation
+  geom_point(aes(color = depth.y))+
+  scale_color_viridis()+
+  geom_abline(intercept = 0, slope = 1)+
+  theme_minimal()+
+  #facet_wrap(~year, scales = "free")+
+  labs(title = paste(dfo_data$name, "observed vs predicted CPUE"))#, race_data$stage, sep = " "))
+```
+
+Same as RACE data, zeroes are overestimated. In addition, low CPUE in the data is overpredicted, and high CPUE in the data is underpredicted.
+
+## Root Mean Square Error (RMSE)
+
+Calculate RMSE between predicted and observed values.
+```{r}
+paste("RMSE:", sqrt(mean(dfo_corr$predictions - dfo_corr$biom_kgkm2)^2), " kg km-2", sep = " ") ### traditional rmse metric, in units num km2
+```
+
+Normalised RMSE. 
+```{r}
+rmse_cv <- sqrt(mean((dfo_corr$predictions - dfo_corr$biom_kgkm2)^2))/(max(dfo_corr$biom_kgkm2)-min(dfo_corr$biom_kgkm2))*100 #### normalised rmse, expressed as a % of the range of observed biomass values, sort of approximates a coefficient of variation 
+paste("Normalised RMSE:", paste0(rmse_cv, "%"), sep = " ")
+```
+What is a good value here?
+
+# Total biomass and biomass per box
+
+The current estimated CPUE is in kg km$^{-2}$. So, just I just turn that into biomss per box. Remember that the area is in m$^2$ for the boxes, so need to divide by 1,000,000.
+
+Do this separate for Alaska and Canada, since we are using different data. Total biomass to calculate only for the respective regions, as well as box biomass. Proportional biomass (S1-S4), instead, makes sense only for the entire model domain, so that will be in another script.
+```{r}
+means_all_years <- means_all_years %>% mutate(biomass = mean_estimates*area*1e-06*1e-03)
+
+means_canada <- means_all_years %>% filter(box_id>=92)
+
+# total_biomass_canada <- sum(means_canada$biomass, na.rm = TRUE) # get total biomass
+# 
+# means_canada <- means_canada %>% mutate(proportion = biomass/total_biomass_canada) # get proportion from each box - needs to sum to 1
+```
+
+```{r}
+means_canada %>% select(box_id, mean_estimates, biomass) %>% st_set_geometry(NULL) %>% kable(align = 'lccc', format = "markdown", 
+      col.names = c("Box", "CPUE (kg km-2)", "Biomass (mt)"))
+```
